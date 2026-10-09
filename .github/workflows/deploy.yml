@@ -1,0 +1,84 @@
+
+name: IT373 CI/CD Deployment
+
+on:
+  push:
+    branches:
+      - qa
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate website
+        run: |
+          test -s index.html
+          test -s Dockerfile
+          grep -q "IT373 Practical Test" index.html
+
+      - name: Set deployment environment
+        id: environment
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_NAME" == "main" ]]; then
+            echo "name=production" >> "$GITHUB_OUTPUT"
+            echo "prefix=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=qa" >> "$GITHUB_OUTPUT"
+            echo "prefix=qa" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: image
+        shell: bash
+        env:
+          PREFIX: ${{ steps.environment.outputs.prefix }}
+        run: |
+          IMAGE="ghcr.io/sathvik-alla/it373-practical-test:${PREFIX}-${GITHUB_SHA}"
+          docker build -t "$IMAGE" .
+          docker run --rm "$IMAGE" nginx -t
+          docker push "$IMAGE"
+          echo "name=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy to DigitalOcean
+        shell: bash
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          ENVIRONMENT: ${{ steps.environment.outputs.name }}
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          ssh -o BatchMode=yes deploy@"$SSH_HOST" \
+            "sudo -n /usr/local/sbin/it373-deploy '$ENVIRONMENT' '$IMAGE'"
